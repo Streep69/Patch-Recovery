@@ -4,51 +4,193 @@ on:
   workflow_dispatch:
     inputs:
       RECOVERY_URL:
-        description: 'RECOVERY URL'
-        required: true
-        default: 'https://transfer.sh/(RECOMMENDED)'
+        description: 'Direct/share URL to recovery (supports .img, .img.lz4, .img.tar, .tar.md5, Dropbox/Drive/TWRP)'
+        required: false
+        default: ''
 
 env:
-  RECOVERY_URL: https://oshi.at/Rpjg
+  # Optional fallback if no input is provided
+  RECOVERY_URL: https://example.com/path/to/recovery.img
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     steps:
-    - name: Check Out
-      uses: actions/checkout@main
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-    - name: Prepare the environment
-      run: |
-        sudo apt install git wget lz4 tar openssl python3 -y
+      - name: Set up Python (for gdown & tooling)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
-    - name: Fetch image from URL
-      run: |
-        ls
-        pwd
-        wget ${{github.event.inputs.RECOVERY_URL }} -O recovery.img
+      - name: Install prerequisites (curl/lz4/tar/file/gdown)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl wget lz4 tar openssl file
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir gdown
 
-    - name: Patch Process-1
-      run: |
-        chmod a+x script1.sh
-        chmod a+x magiskboot
-        ./script1.sh || true
+      - name: Ensure patch tools exist (magiskboot, avbtool, scripts)
+        run: |
+          set -euo pipefail
+          need_fetch=false
+          for f in magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar; do
+            if [ ! -e "$f" ]; then
+              echo "Missing $f -> will fetch from upstream"
+              need_fetch=true
+            fi
+          done
+          if $need_fetch; then
+            # Fetch from upstream Patch-Recovery repo (public)
+            base="https://raw.githubusercontent.com/Johx22/Patch-Recovery/master"
+            curl -L --fail -o magiskboot           "$base/magiskboot"
+            curl -L --fail -o avbtool              "$base/avbtool"
+            curl -L --fail -o script1.sh           "$base/script1.sh"
+            curl -L --fail -o script2.sh           "$base/script2.sh"
+            curl -L --fail -o vbmeta_disabled_R.tar "$base/vbmeta_disabled_R.tar"
+          fi
+          chmod +x magiskboot avbtool script1.sh script2.sh
 
-    - name: Patch Process-2
-      run: |
-        chmod a+x script2.sh
-        ./script2.sh || true
-        python3 avbtool extract_public_key --key phh.pem --output phh.pub.bin
-        python3 avbtool add_hash_footer --partition_name recovery --partition_size $(wc -c recovery.img |cut -f 1 -d ' ') --image recovery-patched.img --key phh.pem --algorithm SHA256_RSA4096
-        mkdir output && cd output
-        mv ../recovery-patched.img recovery.img
-        tar cvf fastbootd-recovery.tar recovery.img
-        md5sum -t fastbootd-recovery.tar >> fastbootd-recovery.tar
-        mv fastbootd-recovery.tar fastbootd-recovery.tar.md5
+      - name: Resolve RECOVERY_URL (input or env)
+        id: resolve
+        run: |
+          set -euo pipefail
+          URL_INPUT="${{ github.event.inputs.RECOVERY_URL }}"
+          if [ -n "$URL_INPUT" ]; then
+            echo "url=$URL_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${{ env.RECOVERY_URL }}" >> "$GITHUB_OUTPUT"
+          fi
 
-    - name: Upload Recovery
-      uses: actions/upload-artifact@v3.0.0
-      with:
-        path: /home/runner/work/Patch-Recovery/Patch-Recovery/output/*.md5
-        name: Patched-Recovery
+      - name: Download recovery (handles Dropbox/Drive/TWRP)
+        id: fetch
+        run: |
+          set -euo pipefail
+          url="${{ steps.resolve.outputs.url }}"
+          echo "Source URL: $url"
+
+          # Normalize Dropbox to a direct binary endpoint and force dl=1
+          if echo "$url" | grep -qi 'dropbox.com'; then
+            url="$(echo "$url" \
+              | sed 's#://www.dropbox.com#://dl.dropboxusercontent.com#; s/[?&]dl=[01]//')"
+            case "$url" in
+              *\?*) url="${url}&dl=1" ;;
+              *)    url="${url}?dl=1" ;;
+            esac
+            echo "Rewritten Dropbox URL: $url"
+          fi
+
+          # Google Drive: use gdown to bypass interstitials/quota confirm
+          if echo "$url" | grep -qiE 'drive\.google\.com|drive\.usercontent\.google\.com|/open\?id='; then
+            echo "Downloading via gdown..."
+            gdown --fuzzy "$url" -O input.bin
+          else
+            echo "Downloading via curl..."
+            curl -L --fail --retry 5 --retry-all-errors \
+              -H "User-Agent: CI-Downloader" \
+              -o input.bin "$url"
+          fi
+
+          # Basic sanity checks
+          test -s input.bin
+          file input.bin || true
+          if file input.bin | grep -qiE 'HTML|XML|ASCII text'; then
+            echo "Downloaded HTML/text, not an image. Link is not direct or expired."
+            exit 86
+          fi
+
+          # Show checksum in summary
+          sha256sum input.bin | tee input.sha256
+          {
+            echo "### Downloaded file SHA-256"
+            echo '```'
+            cat input.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Normalize to recovery.img (.tar/.md5/.lz4 supported)
+        run: |
+          set -euo pipefail
+          # If tar archive (TWRP .img.tar or .tar.md5), extract the first *.img or *.img.lz4
+          if file input.bin | grep -qi 'tar archive'; then
+            echo "Detected tar archive; listing contents:"
+            tar tf input.bin || true
+            # Extract all; then pick a recovery*.img or *.img.lz4
+            mkdir -p extracted && tar -xf input.bin -C extracted
+            cand=""
+            for name in recovery.img recovery*.img *.img *.img.lz4; do
+              if [ -f "extracted/$name" ]; then cand="extracted/$name"; break; fi
+            done
+            if [ -z "$cand" ]; then
+              echo "No .img/.img.lz4 found inside tar."
+              exit 87
+            fi
+            mv "$cand" stage.img
+          else
+            mv input.bin stage.img
+          fi
+
+          # If LZ4 compressed, decompress to raw .img
+          if file stage.img | grep -qi 'LZ4'; then
+            echo "Detected LZ4; decompressing..."
+            lz4 -d -f stage.img recovery.img
+          else
+            mv stage.img recovery.img
+          fi
+
+          # Final sanity: must be a boot/recovery image (Android header)
+          file recovery.img || true
+          if ! file recovery.img | grep -qiE 'Android boot|Android sparse|data'; then
+            echo "Warning: file(1) did not recognize Android header; continuing anyway."
+          fi
+          test -s recovery.img
+
+          sha256sum recovery.img | tee recovery.sha256
+          {
+            echo "### Normalized recovery.img SHA-256"
+            echo '```'
+            cat recovery.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Patch Process – Phase 1
+        run: |
+          set -euo pipefail
+          ./script1.sh || true
+
+      - name: Patch Process – Phase 2 (AVB footer & Odin tar.md5)
+        run: |
+          set -euo pipefail
+          ./script2.sh || true
+
+          # Ensure avbtool call works even if upstream scripts didn’t do it
+          # (Keeps your original logic but guarantees footer is present)
+          python3 avbtool extract_public_key --key phh.pem --output phh.pub.bin || true
+          python3 avbtool add_hash_footer \
+            --partition_name recovery \
+            --partition_size "$(wc -c recovery.img | awk '{print $1}')" \
+            --image recovery-patched.img \
+            --key phh.pem \
+            --algorithm SHA256_RSA4096
+
+          mkdir -p output
+          mv recovery-patched.img output/recovery.img
+
+          # Build Odin-friendly tar.md5 (PASS in Odin AP)
+          tar -C output -cvf output/fastbootd-recovery.tar recovery.img
+          ( cd output && md5sum -t fastbootd-recovery.tar >> fastbootd-recovery.tar )
+          mv output/fastbootd-recovery.tar output/fastbootd-recovery.tar.md5
+
+          # Also publish vbmeta_disabled_R.tar (flash in USERDATA slot or per guide)
+          cp vbmeta_disabled_R.tar output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Patched-Recovery
+          path: |
+            ${{ github.workspace }}/output/fastbootd-recovery.tar.md5
+            ${{ github.workspace }}/output/vbmeta_disabled_R.tar
