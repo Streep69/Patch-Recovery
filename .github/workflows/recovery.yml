@@ -1,11 +1,9 @@
 # -----------------------------------------------------------------
 # Samsung Galaxy S10 5G (SM-G977B) fastbootd-TWRP build pipeline
 # Exit codes:
-#   86  HTML or ASCII instead of binary download
-#   87  Resulting file is not an Android boot image
-#   88  Patched image exceeds PARTITION_SIZE bytes
-#   89  SHA-256 mismatch on downloaded base image
-#   90  SHA-256 mismatch on patched recovery image
+#   86 HTML / ASCII instead of binary          87 not a bootimg
+#   88 size > PARTITION_SIZE                  89 SHA-256 mismatch (src)
+#   90 SHA-256 mismatch (patched)
 # -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
@@ -47,7 +45,7 @@ jobs:
           sudo apt-get install -y curl wget lz4 tar file openssl
           pipx install gdown
 
-      - name: Fetch helper tools (fork → upstream fallback)
+      - name: Fetch helper tools
         run: |
           set -euo pipefail
           for f in $REQ_FILES; do
@@ -64,18 +62,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir _dl && cd _dl
-          url="${{ github.event.inputs.RECOVERY_URL }}"
-          # Normalise Dropbox links
+          # Trim any CR/LF that GitHub may append
+          url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL }}" | tr -d '\r\n')"
+
+          # Dropbox → direct
           if echo "$url" | grep -q 'dropbox.com'; then
             url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
             url="${url/&dl=0/&dl=1}"
           fi
-          # Google Drive links
+
+          # Google Drive
           if echo "$url" | grep -q 'drive.google.com'; then
             gdown --fuzzy "$url" -O in.bin
           else
             curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
           fi
+
           file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
           echo "$url" > ../final.url
 
