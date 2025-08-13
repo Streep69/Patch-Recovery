@@ -1,48 +1,53 @@
-# ----------------------------------------------------------
-# Samsung Galaxy S10 5G (SM-G977B) fastbootd-TWRP build
-# Exit codes: 86 HTML | 87 no-IMG | 88 >SIZE | 89 SHA-src | 90 SHA-dst
-# ----------------------------------------------------------
+# -----------------------------------------------------------------
+# Samsung Galaxy S10 5G (SM-G977B) fastbootd-TWRP build pipeline
+# Exit codes:
+#   86  HTML or ASCII instead of binary download
+#   87  Resulting file is not an Android boot image
+#   88  Patched image exceeds PARTITION_SIZE bytes
+#   89  SHA-256 mismatch on downloaded base image
+#   90  SHA-256 mismatch on patched recovery image
+# -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
 on:
   workflow_dispatch:
     inputs:
       RECOVERY_URL:
-        description: Direct URL to base recovery (.tar/.img/.lz4)
-        default: https://dl.twrp.me/beyondx/twrp-3.7.0_9-1-beyondx.img.tar
+        description: "Direct URL to base recovery (.tar/.img/.lz4)"
+        default: "https://dl.twrp.me/beyondx/twrp-3.7.0_9-1-beyondx.img.tar"
       PARTITION_SIZE:
-        description: Recovery partition size (bytes)
-        default: '67108864'
+        description: "Recovery partition size in bytes"
+        default: "67108864"
   push:
     paths:
-      - '.github/workflows/recovery.yml'
-      - '*.sh'
-      - '*.sha256'
+      - ".github/workflows/recovery.yml"
+      - "*.sh"
+      - "*.sha256"
   pull_request:
     paths:
-      - '.github/workflows/recovery.yml'
-      - '*.sh'
-      - '*.sha256'
+      - ".github/workflows/recovery.yml"
+      - "*.sh"
+      - "*.sha256"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      FORK_TOOLS:      https://raw.githubusercontent.com/Streep69/Patch-Recovery/main
-      UPSTREAM_TOOLS:  https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
-      REQ_FILES:       magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar
+      FORK_TOOLS: "https://raw.githubusercontent.com/Streep69/Patch-Recovery/main"
+      UPSTREAM_TOOLS: "https://raw.githubusercontent.com/Johx22/Patch-Recovery/master"
+      REQ_FILES: "magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar"
 
     steps:
-      - name: 📥 Checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y curl wget lz4 tar file openssl
           pipx install gdown
 
-      - name: 🛠️ Fetch helper tools (fork → upstream fallback)
+      - name: Fetch helper tools (fork → upstream fallback)
         run: |
           set -euo pipefail
           for f in $REQ_FILES; do
@@ -51,85 +56,91 @@ jobs:
             chmod +x "$f" || true
           done
 
-      - name: 🔑 Generate AVB key
+      - name: Generate AVB key
         run: openssl genrsa -out avb.pem 4096
 
-      - name: 🌐 Download recovery base
+      - name: Download recovery base
         id: dl
         run: |
           set -euo pipefail
           mkdir _dl && cd _dl
           url="${{ github.event.inputs.RECOVERY_URL }}"
-          # Dropbox → direct
-          [[ "$url" =~ dropbox.com ]] && \
-            url=${url//www.dropbox.com/dl.dropboxusercontent.com} && \
-            url=${url/&dl=0/&dl=1}
-          # Google Drive
-          if [[ "$url" =~ drive.google.com ]]; then
+          # Normalise Dropbox links
+          if echo "$url" | grep -q 'dropbox.com'; then
+            url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
+            url="${url/&dl=0/&dl=1}"
+          fi
+          # Google Drive links
+          if echo "$url" | grep -q 'drive.google.com'; then
             gdown --fuzzy "$url" -O in.bin
           else
             curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
           fi
-          file in.bin | grep -qE 'HTML|ASCII' && { echo 'HTML received'; exit 86; }
+          file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
           echo "$url" > ../final.url
 
-      - name: 🧮 Verify download SHA-256 (optional)
+      - name: Verify download SHA-256 (optional)
         if: ${{ hashFiles('input.sha256') != '' }}
         run: |
           set -euo pipefail
           cd _dl
           EXPECT=$(awk '{print $1}' ../input.sha256)
           ACTUAL=$(sha256sum in.bin | awk '{print $1}')
-          [[ "$ACTUAL" == "$EXPECT" ]] || { echo 'SHA-256 mismatch'; exit 89; }
+          [ "$EXPECT" = "$ACTUAL" ] || { echo "SHA-256 mismatch"; exit 89; }
 
-      - name: 📂 Extract image
+      - name: Extract image
         run: |
           set -euo pipefail
           cd _dl
           if file in.bin | grep -q 'tar archive'; then
-            tar -xf in.bin && img=$(ls *.img* | head -n1)
+            tar -xf in.bin
+            img=$(ls *.img* | head -n1)
           else
             img=in.bin
           fi
-          [[ "$img" =~ \.lz4$ ]] && lz4 -d "$img" recovery.img || mv "$img" recovery.img
+          case "$img" in
+            *.lz4) lz4 -d "$img" recovery.img ;;
+            *)     mv "$img" recovery.img ;;
+          esac
 
-      - name: 🩹 Patch ramdisk → add fastbootd
+      - name: Patch ramdisk (fastbootd)
         run: cd _dl && ../script1.sh
 
-      - name: 🧹 Clean fstab (verity/avb flags)
+      - name: Clean fstab (verity/avb flags)
         run: cd _dl && ../script2.sh
 
-      - name: 🖋️ Add AVB footer
+      - name: Add AVB footer
         run: |
           set -euo pipefail
           cd _dl
-          SIZE=${{ github.event.inputs.PARTITION_SIZE }}
+          SIZE="${{ github.event.inputs.PARTITION_SIZE }}"
           ../avbtool add_hash_footer \
             --partition_name recovery \
             --partition_size "$SIZE" \
             --image recovery.img \
             --key ../avb.pem \
             --algorithm SHA256_RSA4096
-          [[ $(stat -c%s recovery.img) -le $SIZE ]] || { echo 'Image too large'; exit 88; }
+          [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-      - name: 🧮 Verify patched image SHA-256 (optional)
+      - name: Verify patched image SHA-256 (optional)
         if: ${{ hashFiles('recovery.sha256') != '' }}
         run: |
           set -euo pipefail
           cd _dl
           EXPECT=$(awk '{print $1}' ../recovery.sha256)
           ACTUAL=$(sha256sum recovery.img | awk '{print $1}')
-          [[ "$ACTUAL" == "$EXPECT" ]] || { echo 'Patched SHA-256 mismatch'; exit 90; }
+          [ "$EXPECT" = "$ACTUAL" ] || { echo "Patched SHA-256 mismatch"; exit 90; }
 
-      - name: 🧪 Self-test: confirm bootimg signature
+      - name: Self-test boot-image signature
         run: |
           set -euo pipefail
           cd _dl
-          file recovery.img | grep -q 'Android bootimg' || { echo 'Not a bootimg'; exit 87; }
+          file recovery.img | grep -q 'Android bootimg' || { echo "Not a bootimg"; exit 87; }
 
-      - name: 📦 Package Odin tar + checksums
+      - name: Package Odin tar and checksums
         run: |
-          OUT=${{ github.workspace }}/output
+          set -euo pipefail
+          OUT="${{ github.workspace }}/output"
           mkdir -p "$OUT"
           cp _dl/recovery.img "$OUT/"
           tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
@@ -138,7 +149,7 @@ jobs:
           cp vbmeta_disabled_R.tar "$OUT/"
           cp final.url input.sha256 recovery.sha256 "$OUT/" 2>/dev/null || true
 
-      - name: 📤 Upload artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Patched-Recovery
