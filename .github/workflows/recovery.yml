@@ -1,54 +1,129 @@
-name: RECOVERY
+name: RECOVERY   # Builds fastbootd-enabled TWRP + vbmeta helper
 
 on:
   workflow_dispatch:
     inputs:
       RECOVERY_URL:
-        description: 'RECOVERY URL'
-        required: true
-        default: 'https://transfer.sh/(RECOMMENDED)'
-
-env:
-  RECOVERY_URL: https://oshi.at/Rpjg
+        description: 'Direct URL (.img | .img.lz4 | .img.tar | .tar.md5)'
+        required: false
+        default: 'https://dl.dropboxusercontent.com/scl/fi/ujl82vag0tpm2p4hk08d4/twrp-beyondx-3.3.1-100_ianmacd-1.img?rlkey=dc525gtc0y306uoemjysjkh7l&dl=1'
+      PARTITION_SIZE:
+        description: 'Recovery partition size (beyondx = 67108864)'
+        required: false
+        default: '67108864'
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
-
+    runs-on: ubuntu-latest
     steps:
-    - name: Check Out
-      uses: actions/checkout@main
+    # ───────────────────────── 0 · Checkout ─────────────────────────
+    - uses: actions/checkout@v4
 
-    - name: Prepare the environment
-      run: |
-        sudo apt install git wget lz4 tar openssl python3 -y
+    # ─────────────────── 1 · Base toolchain packages ──────────────────
+    - uses: actions/setup-python@v5
+      with: { python-version: '3.x' }
 
-    - name: Fetch image from URL
+    - name: Install system packages
       run: |
-        ls
-        pwd
-        wget ${{github.event.inputs.RECOVERY_URL }} -O recovery.img
+        sudo apt-get update -y
+        sudo apt-get install -y curl wget lz4 tar file openssl
+        python -m pip install --upgrade pip
+        pip install --no-cache-dir gdown
 
-    - name: Patch Process-1
+    # ─────────────── 2 · Ensure patch tools are present ───────────────
+    - name: Prepare patch tools
       run: |
-        chmod a+x script1.sh
-        chmod a+x magiskboot
+        set -euo pipefail
+        upstream=https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
+        for f in magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar; do
+          [ -e "$f" ] || curl -Ls -o "$f" "$upstream/$f"
+        done
+        chmod +x magiskboot avbtool script1.sh script2.sh
+        # Local 4096-bit key for AVB footer
+        openssl genrsa -out avb.pem 4096
+
+    # ─────────────────── 3 · Download base recovery ───────────────────
+    - name: Download recovery image
+      env: { URL_IN: ${{ github.event.inputs.RECOVERY_URL }} }
+      run: |
+        set -euo pipefail
+        mkdir -p _dl && cd _dl
+        url="$URL_IN"
+
+        # Normalise Dropbox (force binary), strip HTML suffix, handle Drive
+        url=$(echo "$url" | sed -E 's/\.img(\.tar)?\.html$/\.img\1/')
+        if echo "$url" | grep -q 'dropbox.com'; then
+          url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
+          url="${url/&dl=0/&dl=1}"
+        fi
+
+        if echo "$url" | grep -qiE 'drive\.google\.com|drive\.usercontent|/open\?id='; then
+          gdown --fuzzy "$url" -O in.bin
+        else
+          curl -L --fail --retry 5 --retry-all-errors -o in.bin "$url"
+        fi
+
+        file in.bin | tee filetype.txt
+        file in.bin | grep -qE 'HTML|ASCII text' && { echo "Bad link (HTML)"; exit 86; }
+
+    # ───────────── 4 · Untar / unlz4 → recovery.img ─────────────
+    - name: Extract to recovery.img
+      run: |
+        set -euo pipefail
+        cd _dl
+        if file in.bin | grep -q 'tar archive'; then
+          tar -xf in.bin
+          img=$(ls *.img* | head -n1)
+        else
+          img=in.bin
+        fi
+        case "$img" in *.lz4) lz4 -d "$img" recovery.img ;; *) mv "$img" recovery.img ;; esac
+        test -s recovery.img
+
+    # ──────────────── 5 · Patch + AVB footer ────────────────
+    - name: Patch & sign
+      env:
+        PARTSIZE: ${{ github.event.inputs.PARTITION_SIZE }}
+      run: |
+        set -euo pipefail
+        cd _dl
+        # copy tools locally for simple call
+        cp ../{magiskboot,avbtool,script1.sh,script2.sh,avb.pem} .
+        chmod +x magiskboot avbtool script1.sh script2.sh
+
         ./script1.sh || true
-
-    - name: Patch Process-2
-      run: |
-        chmod a+x script2.sh
         ./script2.sh || true
-        python3 avbtool extract_public_key --key phh.pem --output phh.pub.bin
-        python3 avbtool add_hash_footer --partition_name recovery --partition_size $(wc -c recovery.img |cut -f 1 -d ' ') --image recovery-patched.img --key phh.pem --algorithm SHA256_RSA4096
-        mkdir output && cd output
-        mv ../recovery-patched.img recovery.img
-        tar cvf fastbootd-recovery.tar recovery.img
-        md5sum -t fastbootd-recovery.tar >> fastbootd-recovery.tar
-        mv fastbootd-recovery.tar fastbootd-recovery.tar.md5
 
-    - name: Upload Recovery
-      uses: actions/upload-artifact@v3.0.0
+        python3 avbtool add_hash_footer \
+          --partition_name recovery \
+          --partition_size "$PARTSIZE" \
+          --image recovery.img \
+          --key avb.pem --algorithm SHA256_RSA4096
+
+        size=$(wc -c < recovery.img)
+        [ "$size" -le "$PARTSIZE" ] || { echo "Image too large"; exit 88; }
+
+    # ──────────────── 6 · Build Odin tar.md5 ────────────────
+    - name: Package Odin tar & helper
+      run: |
+        set -euo pipefail
+        OUT=${{ github.workspace }}/output
+        mkdir -p "$OUT"
+        cp _dl/recovery.img "$OUT/"
+        tar -C "$OUT" -cvf "$OUT/fastbootd-recovery.tar" recovery.img
+        ( cd "$OUT" && md5sum -t fastbootd-recovery.tar >> fastbootd-recovery.tar )
+        mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
+        cp vbmeta_disabled_R.tar "$OUT/" || true
+
+    # ──────────────── 7 · Upload artifacts ────────────────
+    - uses: actions/upload-artifact@v4
       with:
-        path: /home/runner/work/Patch-Recovery/Patch-Recovery/output/*.md5
         name: Patched-Recovery
+        path: ${{ github.workspace }}/output/*
+
+    # ─── 8 · Always upload debug bundle if something goes wrong ──
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Debug-Download-Bundle
+        path: ${{ github.workspace }}/_dl/*
