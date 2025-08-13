@@ -112,8 +112,8 @@ jobs:
       run: |
         set -euo pipefail
         cd _dl
-        ../../script1.sh || true
-        ../../script2.sh || true
+        ./script1.sh || true
+        ./script2.sh || true
         python3 ../../avbtool add_hash_footer \
           --partition_name recovery \
           --partition_size "$SIZE" \
