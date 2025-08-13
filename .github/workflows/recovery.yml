@@ -18,7 +18,7 @@ env:
   # Fallback link (your Dropbox file, already in raw-download form)
   FALLBACK_URL: |
     https://dl.dropboxusercontent.com/scl/fi/ujl82vag0tpm2p4hk08d4/\
-twrp-beyondx-3.3.1-100_ianmacd-1.img?rlkey=dc525gtc0y306uoemjysjkh7l&dl=1
+    twrp-beyondx-3.3.1-100_ianmacd-1.img?rlkey=dc525gtc0y306uoemjysjkh7l&dl=1
 
 jobs:
   build:
