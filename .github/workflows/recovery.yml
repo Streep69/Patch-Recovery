@@ -1,99 +1,89 @@
-name: RECOVERY
+name: RECOVERY   # builds fastbootd-enabled TWRP + vbmeta tar
 
 on:
   workflow_dispatch:
     inputs:
       RECOVERY_URL:
-        description: 'Direct link (.img | .img.lz4 | .img.tar | .tar.md5)'
-        required: true
-      PARTITION_SIZE:
-        description: 'Recovery partition size in bytes (beyondx = 67108864)'
+        description: >
+          Direct link to base recovery
+          (.img | .img.lz4 | .img.tar | .tar.md5).
+          Leave blank to use the embedded Dropbox URL.
         required: false
-        default: '67108864'
+        default: 'https://dl.dropboxusercontent.com/scl/fi/ujl82vag0tpm2p4hk08d4/twrp-beyondx-3.3.1-100_ianmacd-1.img?rlkey=dc525gtc0y306uoemjysjkh7l&dl=1'
+
+      PARTITION_SIZE:
+        description: 'Recovery-partition size in bytes (SM-G977B = 67108864)'
+        required: false
+        default: '67108864'   # 64 MiB
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    # 0 ─ Repository checkout
+    # 0 ─ checkout
     - uses: actions/checkout@v4
 
-    # 1 ─ Toolchain
+    # 1 ─ toolchain
     - uses: actions/setup-python@v5
       with: { python-version: '3.x' }
 
-    - name: Install packages
+    - name: install deps
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl
         python -m pip install --upgrade pip
         pip install --no-cache-dir gdown
 
-    # 2 ─ Locate patch tools (search anywhere in repo); fetch if missing
-    - name: Locate or fetch magiskboot / avbtool / scripts
-      id: tools
+    # 2 ─ pull patch tools if missing
+    - name: get magiskboot / avbtool / scripts
+      run: |
+        set -euo pipefail
+        up=https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
+        for f in magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar; do
+          [ -e "$f" ] || curl -Ls -o "$f" "$up/$f"
+        done
+        chmod +x magiskboot avbtool script1.sh script2.sh
+        openssl genrsa -out avb.pem 4096
+
+    # 3 ─ download base image (Dropbox/Drive/TWRP handled)
+    - name: download recovery
+      id: dl
+      env:
+        URL_INPUT: ${{ github.event.inputs.RECOVERY_URL }}
       run: |
         set -euo pipefail
         WS="${{ github.workspace }}"
-        find_tool() { find "$WS" -type f -name "$1" | head -n1 || true; }
-        # Search
-        MB=$(find_tool magiskboot) || true
-        AT=$(find_tool avbtool)   || true
-        S1=$(find_tool script1.sh)|| true
-        S2=$(find_tool script2.sh)|| true
-        VB=$(find_tool vbmeta_disabled_R.tar) || true
+        mkdir -p "$WS/_dl" && cd "$WS/_dl"
+        url="${URL_INPUT:-${{ inputs.RECOVERY_URL }}}"
 
-        upstream=https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
-        # Download missing ones
-        [ -n "$MB" ] || { curl -Ls -o "$WS/magiskboot"          "$upstream/magiskboot";  MB=$WS/magiskboot; }
-        [ -n "$AT" ] || { curl -Ls -o "$WS/avbtool"             "$upstream/avbtool";     AT=$WS/avbtool;    }
-        [ -n "$S1" ] || { curl -Ls -o "$WS/script1.sh"          "$upstream/script1.sh";  S1=$WS/script1.sh; }
-        [ -n "$S2" ] || { curl -Ls -o "$WS/script2.sh"          "$upstream/script2.sh";  S2=$WS/script2.sh; }
-        [ -n "$VB" ] || { curl -Ls -o "$WS/vbmeta_disabled_R.tar" "$upstream/vbmeta_disabled_R.tar"; VB=$WS/vbmeta_disabled_R.tar; }
+        # TWRP html-page → direct file
+        url=$(echo "$url" | sed -E 's/\.img(\.tar)?\.html$/\.img\1/')
 
-        chmod +x "$MB" "$AT" "$S1" "$S2"
-        echo "MB=$MB" >> "$GITHUB_OUTPUT"
-        echo "AT=$AT" >> "$GITHUB_OUTPUT"
-        echo "S1=$S1" >> "$GITHUB_OUTPUT"
-        echo "S2=$S2" >> "$GITHUB_OUTPUT"
-        echo "VB=$VB" >> "$GITHUB_OUTPUT"
-        # Local AVB key
-        openssl genrsa -out "$WS/avb.pem" 4096
-
-    # 3 ─ Download base image
-    - name: Download recovery
-      id: dl
-      env: { URL: ${{ github.event.inputs.RECOVERY_URL }} }
-      run: |
-        set -euo pipefail
-        mkdir -p _dl && cd _dl
-        url="$URL"
-        # Fix Dropbox share → binary
+        # Dropbox preview → raw
         if echo "$url" | grep -qi 'dropbox.com'; then
           url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
           url="${url/&dl=0/&dl=1}"
         fi
-        # Fix TWRP file-page (strip .html)
-        url=$(echo "$url" | sed -E 's/\.img(\.tar)?\.html$/\.img\1/')
+
         echo "$url" > final.url
 
-        if echo "$url" | grep -qiE 'drive\.google\.com|drive\.usercontent\.google'; then
+        if echo "$url" | grep -qiE 'drive\.google\.com|drive\.usercontent|/open\?id='; then
           gdown --fuzzy "$url" -O in.bin
         else
           curl -L --fail --retry 5 --retry-all-errors -o in.bin "$url"
         fi
 
-        # Abort if HTML
-        if file in.bin | grep -qiE 'HTML|ASCII text|XML'; then
-          echo "Downloaded HTML instead of binary"; exit 86; fi
+        # abort if HTML
+        file in.bin | tee filetype.txt
+        file in.bin | grep -qiE 'HTML|ASCII text|XML' && { echo "HTML received → bad link"; exit 86; }
         sha256sum in.bin > input.sha256
 
-    # 4 ─ Untar / unlz4 → recovery.img
-    - name: Normalize to recovery.img
+    # 4 ─ untar / unlz4 → recovery.img
+    - name: extract recovery.img
       run: |
         set -euo pipefail
-        cd _dl
+        cd "${{ github.workspace }}/_dl"
         if file in.bin | grep -q 'tar archive'; then
           tar -xf in.bin
           img=$(ls *.img* | head -n1)
@@ -104,48 +94,43 @@ jobs:
         test -s recovery.img
         sha256sum recovery.img > recovery.sha256
 
-    # 5 ─ Patch & AVB footer
-    - name: Patch & sign
+    # 5 ─ patch + AVB footer
+    - name: patch + sign
       env:
         SIZE: ${{ github.event.inputs.PARTITION_SIZE }}
-        MB: ${{ steps.tools.outputs.MB }}
-        AT: ${{ steps.tools.outputs.AT }}
-        S1: ${{ steps.tools.outputs.S1 }}
-        S2: ${{ steps.tools.outputs.S2 }}
       run: |
         set -euo pipefail
-        cd _dl
-        "$S1" || true
-        "$S2" || true
-        python3 "$AT" add_hash_footer \
+        cd "${{ github.workspace }}/_dl"
+        ../../script1.sh || true
+        ../../script2.sh || true
+        python3 ../../avbtool add_hash_footer \
           --partition_name recovery \
           --partition_size "$SIZE" \
           --image recovery.img \
-          --key ../avb.pem \
+          --key ../../avb.pem \
           --algorithm SHA256_RSA4096
         actual=$(wc -c < recovery.img)
-        [ "$actual" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
+        [ "$actual" -le "$SIZE" ] || { echo "image too large ($actual > $SIZE)"; exit 88; }
 
-    # 6 ─ Pack Odin tar.md5
-    - name: Build Odin package
-      env: { VB: ${{ steps.tools.outputs.VB }} }
+    # 6 ─ pack Odin tar.md5 + vbmeta helper
+    - name: pack odin tar
       run: |
         set -euo pipefail
-        OUT=$GITHUB_WORKSPACE/output
+        OUT=${{ github.workspace }}/output
         mkdir -p "$OUT"
-        cp _dl/recovery.img "$OUT/"
+        cp "${{ github.workspace }}/_dl/recovery.img" "$OUT/"
         tar -C "$OUT" -cvf "$OUT/fastbootd-recovery.tar" recovery.img
         ( cd "$OUT" && md5sum -t fastbootd-recovery.tar >> fastbootd-recovery.tar )
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
-        cp "$VB" "$OUT/" || true
+        cp vbmeta_disabled_R.tar "$OUT/" || true
 
-    # 7 ─ Upload artifacts
+    # 7 ─ upload artifacts
     - uses: actions/upload-artifact@v4
       with:
         name: Patched-Recovery
         path: ${{ github.workspace }}/output/*
 
-    # 8 ─ Always upload debug bundle
+    # 8 ─ always upload debug bundle
     - if: always()
       uses: actions/upload-artifact@v4
       with:
