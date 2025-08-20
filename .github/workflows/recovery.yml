@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       RECOVERY_URL:
-        description: Direct URL to base recovery (.tar/.img/.lz4)
+        description: Direct URL to recovery (.tar/.img/.lz4)
         default: https://dl.twrp.me/beyondx/twrp-3.7.0_9-1-beyondx.img.tar
       PARTITION_SIZE:
         description: Recovery partition size in bytes
@@ -15,40 +15,27 @@ jobs:
     env:
       FORK_TOOLS: https://raw.githubusercontent.com/${{ github.repository }}/main
       UPSTREAM_TOOLS: https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
-      REQ_FILES: magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar
+      # avbtool no longer downloaded!
+      REQ_FILES: magiskboot script1.sh script2.sh vbmeta_disabled_R.tar
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Install deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl wget lz4 tar file openssl coreutils
+          sudo apt-get install -y curl wget lz4 tar file openssl
           pipx install gdown
 
-      - name: Fetch helper tools + scripts
+      - name: Fetch helper tools
         run: |
           set -euo pipefail
           for f in $REQ_FILES; do
-            curl -fsSL -o "$f" "$FORK_TOOLS/$f" \
-            || curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" \
-            || { echo "$f missing"; exit 99; }
+            curl -fsSL -o "$f" "$FORK_TOOLS/$f" ||
+            curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" ||
+            { echo "$f missing"; exit 99; }
             chmod +x "$f" || true
           done
-          if ! grep -q "cmd_set_hashtype" avbtool; then
-            echo "Upgrading avbtool…"
-            urls=(
-              "https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21/avbtool.py"
-              "https://raw.githubusercontent.com/GrapheneOS/platform_external_avb/13/avbtool.py"
-            )
-            for u in "${urls[@]}"; do
-              echo "  ➜ $u"
-              if curl -Lf --retry 3 -o avbtool "$u"; then
-                chmod +x avbtool
-                break
-              fi
-            done
-            grep -q "cmd_set_hashtype" avbtool || { echo "!! avbtool still old"; exit 22; }
-          fi
 
       - name: Generate AVB key
         run: openssl genrsa -out avb.pem 4096
@@ -58,11 +45,8 @@ jobs:
           set -euo pipefail
           mkdir _dl && cd _dl
           url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL}}" | tr -d '\r\n')"
-          if echo "$url" | grep -q 'dropbox.com'; then
-            url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
-            url="${url/&dl=0/&dl=1}"
-          fi
-          if echo "$url" | grep -q 'drive.google.com'; then
+          [[ "$url" == *dropbox.com* ]] && url="${url//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"
+          if [[ "$url" == *drive.google.com* ]]; then
             gdown --fuzzy "$url" -O in.bin
           else
             curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
@@ -71,7 +55,7 @@ jobs:
 
       - run: cd _dl && ../script1.sh
       - run: cd _dl && ../script2.sh
-      - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
+      - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img   # SHA-1 switch
 
       - name: Add AVB footer
         run: |
@@ -95,7 +79,7 @@ jobs:
           mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
           cp vbmeta_disabled_R.tar "$OUT/" || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4   # v3 retired Jan 2025 :contentReference[oaicite:3]{index=3}
         with:
           name: Patched-Recovery
           path: output/*
