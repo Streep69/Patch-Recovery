@@ -1,8 +1,4 @@
-# -----------------------------------------------------------------
-# Samsung Galaxy S10 5G fastbootd-TWRP pipeline
-# -----------------------------------------------------------------
 name: Build-Patched-Recovery
-
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +25,6 @@ jobs:
         sudo apt-get install -y curl wget lz4 tar file openssl coreutils
         pipx install gdown
 
-    # ---------------- HELPER TOOLS (FIXED) ----------------
     - name: Fetch helper tools + scripts
       run: |
         set -euo pipefail
@@ -39,29 +34,15 @@ jobs:
           || { echo "$f missing"; exit 99; }
           chmod +x "$f" || true
         done
-
+        # ---------- Upgrade avbtool only if 'set_hashtype' unsupported ----------
         if ! grep -q "cmd_set_hashtype" avbtool; then
           echo "Upgrading avbtool to a version that supports set_hashtype…"
-          urls=(
-            "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool?format=TEXT"
-            "https://raw.githubusercontent.com/PixelExperience/external_avb/master/avbtool.py"
-          )
-          success=0
-          for u in "${urls[@]}"; do
-            echo "  ↳ trying $u"
-            if curl -fsSL "$u" -o avbtool.tmp; then
-              if head -n1 avbtool.tmp | grep -q ")]}'"; then
-                tail -n +2 avbtool.tmp | base64 -d > avbtool
-              else
-                mv avbtool.tmp avbtool
-              fi
-              success=1 && break
-            fi
-          done
-          [ "$success" -eq 1 ] || { echo "!! could not fetch avbtool"; exit 22; }
+          curl -Lf --retry 3 \
+               -o avbtool \
+               https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21/avbtool.py \
+          || { echo "!! could not fetch new avbtool"; exit 22; }
           chmod +x avbtool
         fi
-    # ------------------------------------------------------
 
     - name: Generate AVB key
       run: openssl genrsa -out avb.pem 4096
