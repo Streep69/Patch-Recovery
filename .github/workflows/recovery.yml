@@ -4,6 +4,7 @@
 #   86 HTML / ASCII instead of binary          87 not a bootimg
 #   88 size > PARTITION_SIZE                  89 SHA-256 mismatch (src)
 #   90 SHA-256 mismatch (patched)
+#   99 helper-tool missing
 # -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
@@ -31,7 +32,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      FORK_TOOLS: "https://raw.githubusercontent.com/Streep69/Patch-Recovery/main"
+      FORK_TOOLS: "https://raw.githubusercontent.com/${{ github.repository }}/main"
       UPSTREAM_TOOLS: "https://raw.githubusercontent.com/Johx22/Patch-Recovery/master"
       REQ_FILES: "magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar"
 
@@ -45,12 +46,12 @@ jobs:
           sudo apt-get install -y curl wget lz4 tar file openssl
           pipx install gdown
 
-      - name: Fetch helper tools
+      - name: Fetch helper tools + scripts
         run: |
           set -euo pipefail
           for f in $REQ_FILES; do
             curl -fsSL -o "$f" "$FORK_TOOLS/$f" || \
-            curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f"
+            curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" || { echo "$f missing"; exit 99; }
             chmod +x "$f" || true
           done
 
@@ -58,11 +59,9 @@ jobs:
         run: openssl genrsa -out avb.pem 4096
 
       - name: Download recovery base
-        id: dl
         run: |
           set -euo pipefail
           mkdir _dl && cd _dl
-          # Trim any CR/LF that GitHub may append
           url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL }}" | tr -d '\r\n')"
 
           # Dropbox → direct
@@ -111,6 +110,12 @@ jobs:
       - name: Clean fstab (verity/avb flags)
         run: cd _dl && ../script2.sh
 
+      - name: Switch AVB hash type to SHA-1
+        run: |
+          set -euo pipefail
+          cd _dl
+          ../avbtool set_hashtype sha1 recovery.img
+
       - name: Add AVB footer
         run: |
           set -euo pipefail
@@ -121,7 +126,7 @@ jobs:
             --partition_size "$SIZE" \
             --image recovery.img \
             --key ../avb.pem \
-            --algorithm SHA256_RSA4096
+            --algorithm SHA1_RSA4096
           [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
       - name: Verify patched image SHA-256 (optional)
@@ -148,7 +153,7 @@ jobs:
           tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
           md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
           mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
-          cp vbmeta_disabled_R.tar "$OUT/"
+          cp vbmeta_disabled_R.tar "$OUT/" || true
           cp final.url input.sha256 recovery.sha256 "$OUT/" 2>/dev/null || true
 
       - name: Upload artifacts
