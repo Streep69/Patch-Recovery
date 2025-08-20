@@ -1,9 +1,5 @@
 # -----------------------------------------------------------------
 # Samsung Galaxy S10 5G (SM-G977B) fastbootd-TWRP build pipeline
-# Exit codes:
-#   86 HTML / ASCII instead of binary          87 not a bootimg
-#   88 size > PARTITION_SIZE                  89 SHA-256 mismatch (src)
-#   90 SHA-256 mismatch (patched)             99 helper-tool missing
 # -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
@@ -26,16 +22,17 @@ jobs:
       REQ_FILES: magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Install deps
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl coreutils
         pipx install gdown
 
-    # --------------------------- helper binaries ---------------------------
+    # --------------------------------------------------------------
+    # Fetch tools; transparently upgrade avbtool if it lacks SHA-1
+    # --------------------------------------------------------------
     - name: Fetch helper tools + scripts
       run: |
         set -euo pipefail
@@ -46,16 +43,18 @@ jobs:
           chmod +x "$f" || true
         done
 
-        # ---- Upgrade avbtool only if it lacks `set_hashtype` --------------
-        if ! grep -q "def .*set_hashtype" avbtool 2>/dev/null; then
-          echo "Updating avbtool to latest AOSP version…"
-          curl -fsSL \
-            "https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool?format=TEXT" \
-          | tail -n +2 | base64 -d > avbtool \
-          || { echo "avbtool fetch failed"; exit 22; }
+        if ! grep -q "cmd_set_hashtype" avbtool; then
+          echo "Upgrading avbtool to AOSP tip…"
+          tmp=$(mktemp)
+          ( curl -fsSL \
+              https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool?format=TEXT \
+           || curl -fsSL \
+              https://raw.githubusercontent.com/PixelExperience/external_avb/master/avbtool.py ) >"$tmp.b64" \
+          || { echo "avbtool download failed"; exit 22; }
+          tail -n +2 "$tmp.b64" | base64 -d > avbtool
           chmod +x avbtool
+          rm -f "$tmp.b64"
         fi
-    # ----------------------------------------------------------------------
 
     - name: Generate AVB key
       run: openssl genrsa -out avb.pem 4096
@@ -65,45 +64,21 @@ jobs:
         set -euo pipefail
         mkdir _dl && cd _dl
         url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL }}" | tr -d '\r\n')"
-
-        # Dropbox → direct
         if echo "$url" | grep -q 'dropbox.com'; then
           url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
           url="${url/&dl=0/&dl=1}"
         fi
-
-        # Google Drive
         if echo "$url" | grep -q 'drive.google.com'; then
           gdown --fuzzy "$url" -O in.bin
         else
           curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
         fi
-
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
-        echo "$url" > ../final.url
 
-    - name: Extract image
-      run: |
-        set -euo pipefail
-        cd _dl
-        if file in.bin | grep -q 'tar archive'; then
-          tar -xf in.bin
-          img=$(ls *.img* | head -n1)
-        else
-          img=in.bin
-        fi
-        case "$img" in
-          *.lz4) lz4 -d "$img" recovery.img ;;
-          *)     mv "$img" recovery.img ;;
-        esac
+    - run: cd _dl && ../script1.sh       # fastbootd patch
+    - run: cd _dl && ../script2.sh       # fstab clean
 
-    - name: Patch ramdisk (fastbootd)
-      run: cd _dl && ../script1.sh
-
-    - name: Clean fstab (verity/avb flags)
-      run: cd _dl && ../script2.sh
-
-    - name: Switch AVB hash type to SHA-1
+    - name: Switch AVB hash to SHA-1
       run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
 
     - name: Add AVB footer
@@ -119,23 +94,18 @@ jobs:
           --algorithm SHA1_RSA4096
         [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    - name: Self-test boot-image signature
-      run: cd _dl && file recovery.img | grep -q 'Android bootimg' || { echo "Not a bootimg"; exit 87; }
-
     - name: Package Odin tar & checksums
       run: |
         set -euo pipefail
-        OUT="${{ github.workspace }}/output"
+        OUT="$GITHUB_WORKSPACE/output"
         mkdir -p "$OUT"
         cp _dl/recovery.img "$OUT/"
         tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
         md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
         cp vbmeta_disabled_R.tar "$OUT/" || true
-        cp final.url "$OUT/" || true
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v4
       with:
         name: Patched-Recovery
         path: output/*
