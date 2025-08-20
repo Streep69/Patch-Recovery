@@ -18,79 +18,84 @@ jobs:
       REQ_FILES: magiskboot avbtool script1.sh script2.sh vbmeta_disabled_R.tar
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Install deps
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y curl wget lz4 tar file openssl coreutils
-        pipx install gdown
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl wget lz4 tar file openssl coreutils
+          pipx install gdown
 
-    - name: Fetch helper tools + scripts
-      run: |
-        set -euo pipefail
-        for f in $REQ_FILES; do
-          curl -fsSL -o "$f" "$FORK_TOOLS/$f" \
-          || curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" \
-          || { echo "$f missing"; exit 99; }
-          chmod +x "$f" || true
-        done
-        # ---------- Upgrade avbtool only if 'set_hashtype' unsupported ----------
-        if ! grep -q "cmd_set_hashtype" avbtool; then
-          echo "Upgrading avbtool to a version that supports set_hashtype…"
-          curl -Lf --retry 3 \
-               -o avbtool \
-               https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21/avbtool.py \
-          || { echo "!! could not fetch new avbtool"; exit 22; }
-          chmod +x avbtool
-        fi
+      - name: Fetch helper tools + scripts
+        run: |
+          set -euo pipefail
+          for f in $REQ_FILES; do
+            curl -fsSL -o "$f" "$FORK_TOOLS/$f" \
+            || curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" \
+            || { echo "$f missing"; exit 99; }
+            chmod +x "$f" || true
+          done
+          if ! grep -q "cmd_set_hashtype" avbtool; then
+            echo "Upgrading avbtool…"
+            urls=(
+              "https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21/avbtool.py"
+              "https://raw.githubusercontent.com/GrapheneOS/platform_external_avb/13/avbtool.py"
+            )
+            for u in "${urls[@]}"; do
+              echo "  ➜ $u"
+              if curl -Lf --retry 3 -o avbtool "$u"; then
+                chmod +x avbtool
+                break
+              fi
+            done
+            grep -q "cmd_set_hashtype" avbtool || { echo "!! avbtool still old"; exit 22; }
+          fi
 
-    - name: Generate AVB key
-      run: openssl genrsa -out avb.pem 4096
+      - name: Generate AVB key
+        run: openssl genrsa -out avb.pem 4096
 
-    - name: Download recovery base
-      run: |
-        set -euo pipefail
-        mkdir _dl && cd _dl
-        url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL }}" | tr -d '\r\n')"
-        if echo "$url" | grep -q 'dropbox.com'; then
-          url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
-          url="${url/&dl=0/&dl=1}"
-        fi
-        if echo "$url" | grep -q 'drive.google.com'; then
-          gdown --fuzzy "$url" -O in.bin
-        else
-          curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
-        fi
-        file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
+      - name: Download recovery base
+        run: |
+          set -euo pipefail
+          mkdir _dl && cd _dl
+          url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL}}" | tr -d '\r\n')"
+          if echo "$url" | grep -q 'dropbox.com'; then
+            url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
+            url="${url/&dl=0/&dl=1}"
+          fi
+          if echo "$url" | grep -q 'drive.google.com'; then
+            gdown --fuzzy "$url" -O in.bin
+          else
+            curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
+          fi
+          file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    - run: cd _dl && ../script1.sh
-    - run: cd _dl && ../script2.sh
-    - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
-    - name: Add AVB footer
-      run: |
-        set -euo pipefail
-        cd _dl
-        SIZE="${{ github.event.inputs.PARTITION_SIZE }}"
-        ../avbtool add_hash_footer \
-          --partition_name recovery \
-          --partition_size "$SIZE" \
-          --image recovery.img \
-          --key ../avb.pem \
-          --algorithm SHA1_RSA4096
-        [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
+      - run: cd _dl && ../script1.sh
+      - run: cd _dl && ../script2.sh
+      - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
 
-    - name: Package Odin tar & checksums
-      run: |
-        set -euo pipefail
-        OUT="$GITHUB_WORKSPACE/output"
-        mkdir -p "$OUT"
-        cp _dl/recovery.img "$OUT/"
-        tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
-        md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
-        mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
-        cp vbmeta_disabled_R.tar "$OUT/" || true
+      - name: Add AVB footer
+        run: |
+          cd _dl
+          SIZE="${{ github.event.inputs.PARTITION_SIZE }}"
+          ../avbtool add_hash_footer \
+            --partition_name recovery \
+            --partition_size "$SIZE" \
+            --image recovery.img \
+            --key ../avb.pem \
+            --algorithm SHA1_RSA4096
+          [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    - uses: actions/upload-artifact@v4
-      with:
-        name: Patched-Recovery
-        path: output/*
+      - name: Package Odin tar & checksums
+        run: |
+          OUT="$GITHUB_WORKSPACE/output"
+          mkdir -p "$OUT"
+          cp _dl/recovery.img "$OUT/"
+          tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
+          md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
+          mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
+          cp vbmeta_disabled_R.tar "$OUT/" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Patched-Recovery
+          path: output/*
