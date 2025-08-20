@@ -3,68 +3,78 @@ name: Build-Patched-Recovery
 on:
   workflow_dispatch:
     inputs:
-      RECOVERY_URL:                         # paste a direct link each run
+      RECOVERY_URL:
         description: "Direct URL to recovery (.tar / .img / .lz4)"
-        required: true
-      PARTITION_SIZE:                       # S10 5G recovery partition = 64 MiB
-        description: "Recovery-partition size in bytes"
-        default: "67108864"
+        required: true                  # UI prompts every run
+      PARTITION_SIZE:
+        description: "Recovery partition size (SM-G977B = 64 MiB)"
+        default:  "67108864"            # = 64 * 1024 * 1024
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    # ----------------------------------------------------------- checkout ---
+    # ----------------------------------------------------------------- code
     - uses: actions/checkout@v4
 
-    # ----------------------------------------------------- install toolchain
+    # ------------------------------------------------ system deps & gdown --
     - name: Install dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl binutils
-        pipx install gdown                            # Google-Drive helper
+        pipx install gdown
 
-    # -------------- real magiskboot (ELF, stripped to save space) ----------
+    # ------------------------------------------ magiskboot (real binary) --
     - name: Fetch magiskboot v26.4
       run: |
         curl -Lf --retry 3 -o magiskboot \
           https://github.com/topjohnwu/Magisk/releases/download/v26.4/magiskboot
         chmod +x magiskboot
-        strip --strip-all magiskboot || true          # ~0.7 MB
+        strip --strip-all magiskboot || true          # shrink ~1.6 MB → 0.7 MB
 
-    # ----------------------------- verify avbtool already in repo ----------
-    - name: Verify avbtool
+    # --------------------------- use repo avbtool, upgrade only if stale --
+    - name: Prepare avbtool
       run: |
-        [ -x avbtool ] || { echo "❌ avbtool missing"; exit 1; }
-        grep -q cmd_set_hashtype avbtool || { echo "❌ avbtool too old"; exit 1; }
-        echo "✓ avbtool OK"
+        chmod +x avbtool                      # ensure executable bit
+        if ! grep -q cmd_set_hashtype avbtool ; then
+          echo "→ Repo avbtool too old — downloading fresh copy"
+          curl -Lf --retry 3 -o avbtool \
+            https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py
+          chmod +x avbtool
+        fi
+        echo "✓ avbtool ready"
 
-    # ------------------------------------------------------- generate key ---
+    # ------------------------------------------- generate signing key -----
     - run: openssl genrsa -out avb.pem 4096
 
-    # --------------------------- download base recovery (HTML guard) --------
+    # ------------------------------------------- fetch base recovery ------
     - name: Download recovery
       run: |
         set -euo pipefail
         mkdir _dl && cd _dl
         URL="${{ github.event.inputs.RECOVERY_URL }}"
+        # Dropbox → direct binary
         [[ "$URL" == *dropbox.com* ]] && URL="${URL//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"
+        # Google Drive
         if [[ "$URL" == *drive.google.com* ]]; then
           gdown --fuzzy "$URL" -O in.bin
         else
           curl -Lf --retry 5 --retry-all-errors -o in.bin "$URL"
         fi
+        # guard: refuse HTML / text
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    # -------------------- apply fastbootd patch & fstab cleanup ------------
-    - run: cd _dl && ../script1.sh         # fastbootd patch (real script)
-    - run: cd _dl && ../script2.sh         # fstab cleanup (real script)
+    # ----------------------------- fastbootd patch & fstab cleanup --------
+    - name: Patch fastbootd
+      run: cd _dl && ../script1.sh        # script1 in repo root
+    - name: Clean fstab
+      run: cd _dl && ../script2.sh        # script2 in repo root
 
-    # --------------------------- switch hash-type to SHA-1 ------------------
+    # ------------------- flip hash-type to SHA-1 (Samsung needs this) -----
     - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
 
-    # ---------------------------- add SHA1_RSA4096 footer -------------------
+    # ---------------------- add SHA1_RSA4096 footer + size guard ----------
     - name: Add AVB footer
       run: |
         cd _dl
@@ -77,8 +87,8 @@ jobs:
           --algorithm SHA1_RSA4096
         [ $(stat -c%s recovery.img) -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    # --------------------------- package Odin TAR + checksums --------------
-    - name: Package artefacts
+    # ----------------------------- package & checksums --------------------
+    - name: Package Odin tar
       run: |
         OUT=$GITHUB_WORKSPACE/output && mkdir -p "$OUT"
         cp _dl/recovery.img "$OUT/"
@@ -86,7 +96,7 @@ jobs:
         md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
 
-    # -------------------------------- upload artefacts ---------------------
+    # ------------------------------- upload artefacts ---------------------
     - uses: actions/upload-artifact@v4
       with:
         name: Patched-Recovery
