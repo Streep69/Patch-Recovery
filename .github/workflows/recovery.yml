@@ -7,69 +7,71 @@ on:
         required: true
       PARTITION_SIZE:
         description: "Recovery partition size (bytes)"
-        default: "67108864"      # 64 MiB
+        default: "67108864"        # S10 5G = 64 MiB
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
     - uses: actions/checkout@v4
 
+    # ------------------------------------------------ system deps ---------
     - name: Install packages
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl binutils jq unzip gzip
-        pipx install gdown
+        pipx install gdown                          # Drive helper
 
-    # ---------- magiskboot v26.4 (asset → APK fallback) -------------------
+    # ------------------------------------ magiskboot v26.4 ---------------
     - name: Get magiskboot
       run: |
         set -euo pipefail
         TAG=v26.4
-        ASSET=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG |
-                 jq -r '.assets[] | select(.name=="magiskboot") | .browser_download_url')
+        ASSET=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG \
+                 | jq -r '.assets[] | select(.name=="magiskboot") | .browser_download_url')
         if [ -n "$ASSET" ]; then
           curl -Lf --retry 3 -o magiskboot "$ASSET"
         else
-          APK=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG |
-                jq -r '.assets[] | select(.name|test("Magisk.*\\.apk")) | .browser_download_url')
-          curl -Lf --retry 3 -o magisk.apk "$APK"
+          APK=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG \
+                 | jq -r '.assets[] | select(.name|test("Magisk.*\\.apk")) | .browser_download_url')
+          curl -Lf --retry 3 -o magisk.apk "$APK"      # mirror also on SF :contentReference[oaicite:1]{index=1}
           unzip -p magisk.apk lib/arm64-v8a/libmagiskboot.so > magiskboot
           rm magisk.apk
         fi
         chmod +x magiskboot
         strip --strip-all magiskboot || true
 
-    # ---------- always fetch modern avbtool (robust mirrors) -------------
+    # ------------------------------------ modern avbtool (4 mirrors) -----
     - name: Ensure avbtool
       run: |
         set -euo pipefail
         mirrors=(
-          "https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py"
-          "https://raw.githubusercontent.com/GrapheneOS/platform_external_avb/aosp-14.0/avbtool.py"
-          "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool.py?format=TEXT"
+          "https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py"          # :contentReference[oaicite:2]{index=2}
+          "https://raw.githubusercontent.com/GrapheneOS/platform_external_avb/aosp-14.0/avbtool.py"           # :contentReference[oaicite:3]{index=3}
+          "https://raw.githubusercontent.com/ArrowOS/android_external_avb/arrow-14.0/avbtool.py"
+          "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool.py?format=TEXT" # :contentReference[oaicite:4]{index=4}
         )
         for u in "${mirrors[@]}"; do
           echo "→ trying $u"
-          if curl -Lf --retry 2 "$u" | { grep -q '^H4s' && base64 -d | gunzip -c || cat; } > avbtool ; then
+          if curl -Lf --retry 2 "$u" | { grep -q '^H4s' && base64 -d | gunzip -c || cat; } > avbtool.tmp ; then
+            mv avbtool.tmp avbtool
             chmod +x avbtool
-            if grep -q cmd_set_hashtype avbtool ; then
-              echo "✓ avbtool ready"
-              break
-            fi
+            grep -q cmd_set_hashtype avbtool && break
           fi
         done
-        grep -q cmd_set_hashtype avbtool || { echo "✖ could not obtain modern avbtool"; exit 22; }
+        grep -q cmd_set_hashtype avbtool || { echo "✖ cannot fetch modern avbtool"; exit 22; }
+        echo "✓ avbtool ready"
 
-    - run: openssl genrsa -out avb.pem 4096
+    - run: openssl genrsa -out avb.pem 4096                    # local key
 
-    # ---------- download recovery (HTML guard) ---------------------------
+    # -------------------------------- download recovery ------------------
     - name: Download recovery
       run: |
         set -euo pipefail
         mkdir _dl && cd _dl
         URL="${{ github.event.inputs.RECOVERY_URL }}"
-        [[ "$URL" == *dropbox.com* ]] && URL="${URL//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"
+        [[ "$URL" == *dropbox.com* ]] && URL="${URL//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"   # trick :contentReference[oaicite:5]{index=5}
         if [[ "$URL" == *drive.google.com* ]]; then
           gdown --fuzzy "$URL" -O in.bin
         else
@@ -77,12 +79,12 @@ jobs:
         fi
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    # ---------- patch -----------------------------------------------------
-    - run: cd _dl && ../script1.sh
-    - run: cd _dl && ../script2.sh
+    # -------------------------------- patch & clean ----------------------
+    - run: cd _dl && ../script1.sh                       # fastbootd patch
+    - run: cd _dl && ../script2.sh                       # fstab cleanup
     - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
 
-    # ---------- footer + size guard --------------------------------------
+    # -------------------------------- footer + 64 MiB guard -------------
     - name: Add AVB footer
       run: |
         cd _dl
@@ -95,7 +97,7 @@ jobs:
           --algorithm SHA1_RSA4096
         [ $(stat -c%s recovery.img) -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    # ---------- package artefacts ----------------------------------------
+    # -------------------------------- package artefacts -----------------
     - name: Package Odin tar
       run: |
         OUT=$GITHUB_WORKSPACE/output && mkdir -p "$OUT"
