@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------
-# Samsung Galaxy S10 5G (SM-G977B) fastbootd-TWRP build pipeline
+# Samsung Galaxy S10 5G fastbootd-TWRP pipeline
 # -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
@@ -23,16 +23,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-
     - name: Install deps
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl coreutils
         pipx install gdown
 
-    # --------------------------------------------------------------
-    # Fetch tools; transparently upgrade avbtool if it lacks SHA-1
-    # --------------------------------------------------------------
+    # ---------------- HELPER TOOLS (FIXED) ----------------
     - name: Fetch helper tools + scripts
       run: |
         set -euo pipefail
@@ -44,17 +41,27 @@ jobs:
         done
 
         if ! grep -q "cmd_set_hashtype" avbtool; then
-          echo "Upgrading avbtool to AOSP tip…"
-          tmp=$(mktemp)
-          ( curl -fsSL \
-              https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool?format=TEXT \
-           || curl -fsSL \
-              https://raw.githubusercontent.com/PixelExperience/external_avb/master/avbtool.py ) >"$tmp.b64" \
-          || { echo "avbtool download failed"; exit 22; }
-          tail -n +2 "$tmp.b64" | base64 -d > avbtool
+          echo "Upgrading avbtool to a version that supports set_hashtype…"
+          urls=(
+            "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool?format=TEXT"
+            "https://raw.githubusercontent.com/PixelExperience/external_avb/master/avbtool.py"
+          )
+          success=0
+          for u in "${urls[@]}"; do
+            echo "  ↳ trying $u"
+            if curl -fsSL "$u" -o avbtool.tmp; then
+              if head -n1 avbtool.tmp | grep -q ")]}'"; then
+                tail -n +2 avbtool.tmp | base64 -d > avbtool
+              else
+                mv avbtool.tmp avbtool
+              fi
+              success=1 && break
+            fi
+          done
+          [ "$success" -eq 1 ] || { echo "!! could not fetch avbtool"; exit 22; }
           chmod +x avbtool
-          rm -f "$tmp.b64"
         fi
+    # ------------------------------------------------------
 
     - name: Generate AVB key
       run: openssl genrsa -out avb.pem 4096
@@ -75,12 +82,9 @@ jobs:
         fi
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    - run: cd _dl && ../script1.sh       # fastbootd patch
-    - run: cd _dl && ../script2.sh       # fstab clean
-
-    - name: Switch AVB hash to SHA-1
-      run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
-
+    - run: cd _dl && ../script1.sh
+    - run: cd _dl && ../script2.sh
+    - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
     - name: Add AVB footer
       run: |
         set -euo pipefail
