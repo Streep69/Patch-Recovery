@@ -1,40 +1,50 @@
 name: Build-Patched-Recovery
+
 on:
   workflow_dispatch:
     inputs:
-      RECOVERY_URL:
+      RECOVERY_URL:                         # paste a direct link each run
         description: "Direct URL to recovery (.tar / .img / .lz4)"
         required: true
-      PARTITION_SIZE:
-        description: "Recovery partition size (bytes)"
+      PARTITION_SIZE:                       # S10 5G recovery partition = 64 MiB
+        description: "Recovery-partition size in bytes"
         default: "67108864"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
+    # ----------------------------------------------------------- checkout ---
     - uses: actions/checkout@v4
 
+    # ----------------------------------------------------- install toolchain
     - name: Install dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl binutils
-        pipx install gdown
+        pipx install gdown                            # Google-Drive helper
 
-    # Fetch magiskboot & avbtool (real binaries/scripts)
-    - name: Download helper binaries
+    # -------------- real magiskboot (ELF, stripped to save space) ----------
+    - name: Fetch magiskboot v26.4
       run: |
-        set -euo pipefail
-        curl -Lf --retry 3 -o magiskboot           https://github.com/topjohnwu/Magisk/releases/download/v26.4/magiskboot
+        curl -Lf --retry 3 -o magiskboot \
+          https://github.com/topjohnwu/Magisk/releases/download/v26.4/magiskboot
         chmod +x magiskboot
-        strip --strip-all magiskboot || true
-        curl -Lf --retry 3 -o avbtool           https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py
-        chmod +x avbtool
+        strip --strip-all magiskboot || true          # ~0.7 MB
 
-    - name: Generate AVB key
-      run: openssl genrsa -out avb.pem 4096
+    # ----------------------------- verify avbtool already in repo ----------
+    - name: Verify avbtool
+      run: |
+        [ -x avbtool ] || { echo "❌ avbtool missing"; exit 1; }
+        grep -q cmd_set_hashtype avbtool || { echo "❌ avbtool too old"; exit 1; }
+        echo "✓ avbtool OK"
 
-    - name: Download base recovery
+    # ------------------------------------------------------- generate key ---
+    - run: openssl genrsa -out avb.pem 4096
+
+    # --------------------------- download base recovery (HTML guard) --------
+    - name: Download recovery
       run: |
         set -euo pipefail
         mkdir _dl && cd _dl
@@ -47,28 +57,36 @@ jobs:
         fi
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    - name: Patch fastbootd
-      run: cd _dl && ../script1.sh
-    - name: Clean fstab
-      run: cd _dl && ../script2.sh
-    - name: Switch AVB hash-type to SHA-1
-      run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
+    # -------------------- apply fastbootd patch & fstab cleanup ------------
+    - run: cd _dl && ../script1.sh         # fastbootd patch (real script)
+    - run: cd _dl && ../script2.sh         # fstab cleanup (real script)
 
+    # --------------------------- switch hash-type to SHA-1 ------------------
+    - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
+
+    # ---------------------------- add SHA1_RSA4096 footer -------------------
     - name: Add AVB footer
       run: |
         cd _dl
         SIZE="${{ github.event.inputs.PARTITION_SIZE }}"
-        ../avbtool add_hash_footer           --partition_name recovery           --partition_size "$SIZE"           --image recovery.img           --key ../avb.pem           --algorithm SHA1_RSA4096
+        ../avbtool add_hash_footer \
+          --partition_name recovery \
+          --partition_size "$SIZE" \
+          --image recovery.img \
+          --key ../avb.pem \
+          --algorithm SHA1_RSA4096
         [ $(stat -c%s recovery.img) -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    - name: Package Odin tar
+    # --------------------------- package Odin TAR + checksums --------------
+    - name: Package artefacts
       run: |
-        OUT=$GITHUB_WORKSPACE/output; mkdir -p "$OUT"
+        OUT=$GITHUB_WORKSPACE/output && mkdir -p "$OUT"
         cp _dl/recovery.img "$OUT/"
         tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
         md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
 
+    # -------------------------------- upload artefacts ---------------------
     - uses: actions/upload-artifact@v4
       with:
         name: Patched-Recovery
