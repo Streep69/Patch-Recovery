@@ -14,62 +14,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-
-    - name: Install deps
+    - name: Install dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl binutils jq unzip gzip
         pipx install gdown
-
-    # ---------- magiskboot v26.4 (asset → APK fallback) -------------------
-    - name: Get magiskboot
+    - name: Fetch magiskboot v26.4
       run: |
-        set -euo pipefail
-        TAG=v26.4
-        ASSET=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG |
-                 jq -r '.assets[] | select(.name=="magiskboot") | .browser_download_url')
-        if [ -n "$ASSET" ]; then
-          curl -Lf --retry 3 -o magiskboot "$ASSET"
-        else
-          APK=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG |
-                jq -r '.assets[] | select(.name|test("Magisk.*\\.apk")) | .browser_download_url')
-          curl -Lf --retry 3 -o magisk.apk "$APK"
-          unzip -p magisk.apk lib/arm64-v8a/libmagiskboot.so > magiskboot
-          rm magisk.apk
-        fi
+        curl -Lf --retry 3 -o magiskboot https://github.com/topjohnwu/Magisk/releases/download/v26.4/magiskboot
         chmod +x magiskboot
         strip --strip-all magiskboot || true
-
-    # ---------- avbtool from Dropbox → mirrors fallback -------------------
-    - name: Ensure avbtool
+    - name: Download avbtool from Dropbox
+      run: |
+        curl -Lf --retry 3 -o avbtool https://dl.dropboxusercontent.com/scl/fi/veijn46qvdcv9mmjka0lq/avbtool.py?rlkey=hyv1iqzmobrb0xb2nihfgnfpm&dl=1
+        chmod +x avbtool
+        grep -q cmd_set_hashtype avbtool || { echo "Downloaded avbtool missing function"; exit 22; }
+    - run: openssl genrsa -out avb.pem 4096
+    - name: Download recovery base
       run: |
         set -euo pipefail
-        DROPBOX="https://dl.dropboxusercontent.com/scl/fo/3mfhvotxmp2fkgdm2o1ek/ADZeuBtD1Y-LHoTtixAYLAk?rlkey=0bdt0ptxq0c5umsx9l3a4x35i&dl=1"
-        if curl -Lf --retry 3 -o avb.zip "$DROPBOX" ; then
-          unzip -j avb.zip "*/avbtool.py" -d . 2>/dev/null && mv avbtool.py avbtool
-          chmod +x avbtool
-          rm avb.zip
-        fi
-        mirrors=(
-          "https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py"
-          "https://raw.githubusercontent.com/GrapheneOS/platform_external_avb/aosp-14.0/avbtool.py"
-          "https://raw.githubusercontent.com/ArrowOS/android_external_avb/arrow-14.0/avbtool.py"
-          "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool.py?format=TEXT"
-        )
-        if ! grep -q cmd_set_hashtype avbtool 2>/dev/null ; then
-          for u in "${mirrors[@]}"; do
-            echo "→ trying $u"
-            if curl -Lf --retry 2 "$u" | { grep -q '^H4s' && base64 -d | gunzip -c || cat; } > avbtool.tmp ; then
-              mv avbtool.tmp avbtool
-              chmod +x avbtool
-              grep -q cmd_set_hashtype avbtool && break
-            fi
-          done
-        fi
-        grep -q cmd_set_hashtype avbtool || { echo "✖ cannot fetch modern avbtool"; exit 22; }
-        echo "✓ avbtool ready"
-
-    - run: openssl genrsa -out avb.pem 4096
-
-    # ---------- (rest of the workflow unchanged) --------------------------
-    # download recovery, patch, footer, package ...
+        mkdir _dl && cd _dl
+        URL="${{ github.event.inputs.RECOVERY_URL }}"
+        [[ "$URL" == *dropbox.com* ]] && URL="${URL//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"
+        curl -Lf --retry 5 --retry-all-errors -o in.bin "$URL"
+        file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
+    - run: cd _dl && ../script1.sh
+    - run: cd _dl && ../script2.sh
+    - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
+    - name: Add AVB footer
+      run: |
+        cd _dl
+        SIZE="${{ github.event.inputs.PARTITION_SIZE }}"
+        ../avbtool add_hash_footer --partition_name recovery --partition_size "$SIZE" --image recovery.img --key ../avb.pem --algorithm SHA1_RSA4096
+        [ $(stat -c%s recovery.img) -le "$SIZE" ] || { echo "Image too large"; exit 88; }
+    - name: Package Odin tar
+      run: |
+        OUT=$GITHUB_WORKSPACE/output
+        mkdir -p "$OUT"
+        cp _dl/recovery.img "$OUT/"
+        tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
+        md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
+        mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Patched-Recovery
+        path: output/*
