@@ -7,8 +7,8 @@ on:
         description: "Direct URL to recovery (.tar / .img / .lz4)"
         required: true
       PARTITION_SIZE:
-        description: "Recovery partition size (bytes)"
-        default:  "67108864"   # 64 MiB
+        description: "Recovery-partition size (bytes, S10 5G = 64 MiB)"
+        default:  "67108864"
 
 jobs:
   build:
@@ -17,43 +17,56 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install deps
+    # -------- system deps & gdown -----------------------------------------
+    - name: Install dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y curl wget lz4 tar file openssl binutils jq unzip
         pipx install gdown
 
-    # ---------- fetch magiskboot (API → asset; APK fallback) --------------
-    - name: Get magiskboot v26.4
+    # -------- fetch magiskboot v26.4 (asset → APK fallback) ---------------
+    - name: Get magiskboot
       run: |
         set -euo pipefail
         TAG=v26.4
-        ASSET_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG | \
-                     jq -r '.assets[] | select(.name=="magiskboot") | .browser_download_url')
-        if [ -n "$ASSET_URL" ]; then
-          echo "→ downloading magiskboot from release asset"
-          curl -Lf --retry 3 -o magiskboot "$ASSET_URL"
+        ASSET=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG | \
+                jq -r '.assets[] | select(.name=="magiskboot") | .browser_download_url')
+        if [ -n "$ASSET" ]; then
+          curl -Lf --retry 3 -o magiskboot "$ASSET"
         else
-          echo "→ asset missing, extracting magiskboot from Magisk APK"
-          APK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG | \
-                     jq -r '.assets[] | select(.name | test("Magisk.*\\.apk")) | .browser_download_url')
-          curl -Lf --retry 3 -o magisk.apk "$APK_URL"
+          echo "asset 404 – extracting from APK"
+          APK=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$TAG | \
+                jq -r '.assets[] | select(.name | test("Magisk.*\\.apk")) | .browser_download_url')
+          curl -Lf --retry 3 -o magisk.apk "$APK"
           unzip -p magisk.apk lib/arm64-v8a/libmagiskboot.so > magiskboot
           rm magisk.apk
         fi
         chmod +x magiskboot
-        strip --strip-all magiskboot || true
+        strip --strip-all magiskboot || true   # keep final image <64 MiB
         file magiskboot
 
-    # ---------- ensure repo avbtool is executable & modern ----------------
+    # -------- ensure modern avbtool (repo copy or Lineage mirror) ---------
     - name: Prepare avbtool
       run: |
+        set -euo pipefail
+        if ! [ -f avbtool ]; then
+          echo "no avbtool in repo – downloading"
+          curl -Lf --retry 3 -o avbtool \
+            https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py
+        fi
         chmod +x avbtool
-        grep -q cmd_set_hashtype avbtool || { echo "❌ avbtool too old"; exit 1; }
+        if ! grep -q cmd_set_hashtype avbtool ; then
+          echo "repo avbtool too old – refreshing"
+          curl -Lf --retry 3 -o avbtool \
+            https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py
+          chmod +x avbtool
+        fi
+        echo "✓ avbtool ready"
 
+    # -------- generate signing key ----------------------------------------
     - run: openssl genrsa -out avb.pem 4096
 
-    # ---------- download base recovery (HTML guard) -----------------------
+    # -------- download base recovery (HTML guard) -------------------------
     - name: Download recovery
       run: |
         set -euo pipefail
@@ -67,12 +80,14 @@ jobs:
         fi
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
 
-    # ---------- apply patches --------------------------------------------
+    # -------- apply fastbootd patch & fstab cleanup -----------------------
     - run: cd _dl && ../script1.sh
     - run: cd _dl && ../script2.sh
+
+    # -------- switch hash-type to SHA-1 -----------------------------------
     - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
 
-    # ---------- footer + 64 MiB guard ------------------------------------
+    # -------- add SHA1_RSA4096 footer & 64 MiB guard -----------------------
     - name: Add AVB footer
       run: |
         cd _dl
@@ -85,7 +100,7 @@ jobs:
           --algorithm SHA1_RSA4096
         [ $(stat -c%s recovery.img) -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-    # ---------- package artefacts ----------------------------------------
+    # -------- package artefacts -------------------------------------------
     - name: Package Odin tar
       run: |
         OUT=$GITHUB_WORKSPACE/output && mkdir -p "$OUT"
@@ -94,6 +109,7 @@ jobs:
         md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
 
+    # -------- upload artefacts --------------------------------------------
     - uses: actions/upload-artifact@v4
       with:
         name: Patched-Recovery
