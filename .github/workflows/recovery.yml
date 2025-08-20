@@ -1,47 +1,94 @@
 name: Build-Patched-Recovery
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      RECOVERY_URL:
+        description: "Direct URL to recovery (.tar / .img / .lz4)"
+        required: true          # ⬅ forces a URL prompt
+      PARTITION_SIZE:
+        description: "Recovery partition size in bytes"
+        default: "67108864"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      FORK_TOOLS: https://raw.githubusercontent.com/${{ github.repository }}/main
       UPSTREAM_TOOLS: https://raw.githubusercontent.com/Johx22/Patch-Recovery/master
-      REQ_FILES: magiskboot script1.sh script2.sh vbmeta_disabled_R.tar
+      REQ_FILES: vbmeta_disabled_R.tar                    # scripts & avbtool live in repo
+
     steps:
     - uses: actions/checkout@v4
-    - run: sudo apt-get update -y && sudo apt-get install -y curl wget lz4 tar file openssl && pipx install gdown
-    - name: Fetch helper tools
+
+    - name: Install deps
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y curl wget lz4 tar file openssl
+        pipx install gdown
+
+    # --- helper download (scripts already vendored) -------------------------
+    - name: Fetch helper file
+      run: |
+        curl -fsSL -o vbmeta_disabled_R.tar \
+             $UPSTREAM_TOOLS/vbmeta_disabled_R.tar
+
+    # --- guarantee executable magiskboot every run --------------------------
+    - name: Ensure magiskboot ELF
       run: |
         set -euo pipefail
-        for f in $REQ_FILES; do
-          curl -fsSL -o "$f" "$FORK_TOOLS/$f" || \
-          curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" || { echo "$f missing"; exit 99; }
-          chmod +x "$f" || true
-        done
-        [ -x ./avbtool ] || curl -Lf --retry 3 -o avbtool https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py && chmod +x avbtool
+        if ! [ -x magiskboot ] || ! file magiskboot | grep -q ELF; then
+          echo "Downloading fresh magiskboot…"
+          curl -Lf --retry 3 -o magiskboot \
+            https://github.com/topjohnwu/Magisk/releases/download/v26.4/magiskboot    # 26.4 current :contentReference[oaicite:3]{index=3}
+          chmod +x magiskboot
+        fi
+
+    # --- ensure modern avbtool (with cmd_set_hashtype) -----------------------
+    - name: Ensure avbtool
+      run: |
+        set -euo pipefail
+        if ! [ -x avbtool ] || ! grep -q cmd_set_hashtype avbtool; then
+          curl -Lf --retry 3 -o avbtool \
+            https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-21.0/avbtool.py   # plain-text mirror :contentReference[oaicite:4]{index=4}
+          chmod +x avbtool
+        fi
+
     - run: openssl genrsa -out avb.pem 4096
+
+    # ---------------- download base recovery -------------------------------
     - name: Download recovery
       run: |
         set -euo pipefail
         mkdir _dl && cd _dl
-        url="${{ inputs.RECOVERY_URL }}"
-        [[ "$url" == *dropbox.com* ]] && url="${url//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"
-        [[ "$url" == *drive.google.com* ]] && gdown --fuzzy "$url" -O in.bin || curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
+        url="${{ github.event.inputs.RECOVERY_URL }}"
+        [[ "$url" == *dropbox.com* ]] && url="${url//www.dropbox.com/dl.dropboxusercontent.com}&dl=1"   # forces binary :contentReference[oaicite:5]{index=5}
+        if [[ "$url" == *drive.google.com* ]]; then
+          gdown --fuzzy "$url" -O in.bin
+        else
+          curl -Lf --retry 5 --retry-all-errors -o in.bin "$url"
+        fi
         file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
-    - run: cd _dl && ../script1.sh
-    - run: cd _dl && ../script2.sh
+
+    - run: cd _dl && ../script1.sh          # fastbootd patch
+    - run: cd _dl && ../script2.sh          # fstab cleanse
     - run: cd _dl && ../avbtool set_hashtype sha1 recovery.img
+
     - name: Add AVB footer
       run: |
         cd _dl
-        ../avbtool add_hash_footer --partition_name recovery --partition_size "${{ inputs.PARTITION_SIZE }}" --image recovery.img --key ../avb.pem --algorithm SHA1_RSA4096
-        [ "$(stat -c%s recovery.img)" -le "${{ inputs.PARTITION_SIZE }}" ] || { echo "Image too large"; exit 88; }
-    - run: |
+        ../avbtool add_hash_footer --partition_name recovery \
+          --partition_size "${{ github.event.inputs.PARTITION_SIZE }}" \
+          --image recovery.img --key ../avb.pem --algorithm SHA1_RSA4096
+        [ "$(stat -c%s recovery.img)" -le "${{ github.event.inputs.PARTITION_SIZE }}" ] \
+          || { echo "Image too large"; exit 88; }
+
+    - name: Package Odin tar
+      run: |
         OUT=$GITHUB_WORKSPACE/output; mkdir -p "$OUT"
         cp _dl/recovery.img "$OUT/"
         tar -C "$OUT" -cf "$OUT/fastbootd-recovery.tar" recovery.img
         md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
         mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
-        cp vbmeta_disabled_R.tar "$OUT/" || true
-    - uses: actions/upload-artifact@v4
+        cp vbmeta_disabled_R.tar "$OUT/"
+
+    - uses: actions/upload-artifact@v4     # v3 retired Jan-2025 
       with: { name: Patched-Recovery, path: output/* }
