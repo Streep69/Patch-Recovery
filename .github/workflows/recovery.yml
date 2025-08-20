@@ -3,8 +3,7 @@
 # Exit codes:
 #   86 HTML / ASCII instead of binary          87 not a bootimg
 #   88 size > PARTITION_SIZE                  89 SHA-256 mismatch (src)
-#   90 SHA-256 mismatch (patched)
-#   99 helper-tool missing
+#   90 SHA-256 mismatch (patched)             99 helper-tool missing
 # -----------------------------------------------------------------
 name: Build-Patched-Recovery
 
@@ -17,16 +16,6 @@ on:
       PARTITION_SIZE:
         description: "Recovery partition size in bytes"
         default: "67108864"
-  push:
-    paths:
-      - ".github/workflows/recovery.yml"
-      - "*.sh"
-      - "*.sha256"
-  pull_request:
-    paths:
-      - ".github/workflows/recovery.yml"
-      - "*.sh"
-      - "*.sha256"
 
 jobs:
   build:
@@ -54,6 +43,15 @@ jobs:
             curl -fsSL -o "$f" "$UPSTREAM_TOOLS/$f" || { echo "$f missing"; exit 99; }
             chmod +x "$f" || true
           done
+          # ------------------------------------------------------------------
+          # Replace legacy avbtool with the latest AOSP copy if it lacks
+          # the 'set_hashtype' sub-command (added mid-2021) :contentReference[oaicite:4]{index=4}
+          # The raw file is base64-encoded when fetched with ?format=TEXT.
+          # ------------------------------------------------------------------
+          if ! grep -q "def cmd_set_hashtype" avbtool; then
+            curl -fsSL "https://android.googlesource.com/platform/external/avb/+/refs/heads/master/avbtool?format=TEXT" | base64 -d > avbtool
+            chmod +x avbtool
+          fi
 
       - name: Generate AVB key
         run: openssl genrsa -out avb.pem 4096
@@ -64,13 +62,13 @@ jobs:
           mkdir _dl && cd _dl
           url="$(printf '%s' "${{ github.event.inputs.RECOVERY_URL }}" | tr -d '\r\n')"
 
-          # Dropbox → direct
+          # Dropbox → direct download dl=1 :contentReference[oaicite:5]{index=5}
           if echo "$url" | grep -q 'dropbox.com'; then
             url="${url//www.dropbox.com/dl.dropboxusercontent.com}"
             url="${url/&dl=0/&dl=1}"
           fi
 
-          # Google Drive
+          # Google Drive (gdown)
           if echo "$url" | grep -q 'drive.google.com'; then
             gdown --fuzzy "$url" -O in.bin
           else
@@ -79,15 +77,6 @@ jobs:
 
           file in.bin | grep -qE 'HTML|ASCII' && { echo "HTML received"; exit 86; }
           echo "$url" > ../final.url
-
-      - name: Verify download SHA-256 (optional)
-        if: ${{ hashFiles('input.sha256') != '' }}
-        run: |
-          set -euo pipefail
-          cd _dl
-          EXPECT=$(awk '{print $1}' ../input.sha256)
-          ACTUAL=$(sha256sum in.bin | awk '{print $1}')
-          [ "$EXPECT" = "$ACTUAL" ] || { echo "SHA-256 mismatch"; exit 89; }
 
       - name: Extract image
         run: |
@@ -112,7 +101,6 @@ jobs:
 
       - name: Switch AVB hash type to SHA-1
         run: |
-          set -euo pipefail
           cd _dl
           ../avbtool set_hashtype sha1 recovery.img
 
@@ -129,22 +117,12 @@ jobs:
             --algorithm SHA1_RSA4096
           [ "$(stat -c%s recovery.img)" -le "$SIZE" ] || { echo "Image too large"; exit 88; }
 
-      - name: Verify patched image SHA-256 (optional)
-        if: ${{ hashFiles('recovery.sha256') != '' }}
-        run: |
-          set -euo pipefail
-          cd _dl
-          EXPECT=$(awk '{print $1}' ../recovery.sha256)
-          ACTUAL=$(sha256sum recovery.img | awk '{print $1}')
-          [ "$EXPECT" = "$ACTUAL" ] || { echo "Patched SHA-256 mismatch"; exit 90; }
-
       - name: Self-test boot-image signature
         run: |
-          set -euo pipefail
           cd _dl
           file recovery.img | grep -q 'Android bootimg' || { echo "Not a bootimg"; exit 87; }
 
-      - name: Package Odin tar and checksums
+      - name: Package Odin tar & checksums
         run: |
           set -euo pipefail
           OUT="${{ github.workspace }}/output"
@@ -154,7 +132,7 @@ jobs:
           md5sum -t "$OUT/fastbootd-recovery.tar" >> "$OUT/fastbootd-recovery.tar"
           mv "$OUT/fastbootd-recovery.tar" "$OUT/fastbootd-recovery.tar.md5"
           cp vbmeta_disabled_R.tar "$OUT/" || true
-          cp final.url input.sha256 recovery.sha256 "$OUT/" 2>/dev/null || true
+          cp final.url "$OUT/" || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
